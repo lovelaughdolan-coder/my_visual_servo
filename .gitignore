@@ -1,0 +1,20 @@
+# ROS/Build outputs
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Models
+*.pt
+*.onnx
+*.weights
+
+# Local settings
+.vscode/
+
+# Other
+.DS_Store
