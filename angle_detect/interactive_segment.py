@@ -4,29 +4,32 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mobile_sam import sam_model_registry, SamPredictor
 import argparse
+from ultralytics import YOLO
+import os
 
-# 全局变量，用于存储用户点击的点和标签
-input_points = []
-input_labels = [] # 1 为前景(正样本)，0 为背景(负样本)
+# 全局变量，用于存储用户手动点击的点以及分组后的成组点
+manual_points = []
+manual_labels = [] # 1 为前景(正样本)，0 为背景(负样本)
+switch_groups = [] # 存储自动聚类或合法成组的闸刀点对: [{'top': [x,y], 'pivot': [x,y]}, ...]
 
 def mouse_callback(event, x, y, flags, param):
-    global input_points, input_labels, img_display
+    global manual_points, manual_labels, img_display
     
     # 左键点击：添加前景点 (绿点)
     if event == cv2.EVENT_LBUTTONDOWN:
-        input_points.append([x, y])
-        input_labels.append(1)
+        manual_points.append([x, y])
+        manual_labels.append(1)
         cv2.circle(img_display, (x, y), 5, (0, 255, 0), -1)
-        cv2.imshow("Image - Click Left for Foreground, Right for Background, Enter to Segment", img_display)
-        print(f"Added Foreground Point at ({x}, {y})")
+        cv2.imshow("Image - Interactive SAM", img_display)
+        print(f"Added Manual Foreground Point at ({x}, {y})")
         
     # 右键点击：添加背景点 (红点)
     elif event == cv2.EVENT_RBUTTONDOWN:
-        input_points.append([x, y])
-        input_labels.append(0)
+        manual_points.append([x, y])
+        manual_labels.append(0)
         cv2.circle(img_display, (x, y), 5, (0, 0, 255), -1)
-        cv2.imshow("Image - Click Left for Foreground, Right for Background, Enter to Segment", img_display)
-        print(f"Added Background Point at ({x}, {y})")
+        cv2.imshow("Image - Interactive SAM", img_display)
+        print(f"Added Manual Background Point at ({x}, {y})")
 
 def show_mask(mask, ax, random_color=False):
     if random_color:
@@ -45,8 +48,9 @@ def show_points(coords, labels, ax, marker_size=375):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive MobileSAM Segmentation")
-    parser.add_argument("--image", type=str, default="images/1.png", help="Path to your image")
-    parser.add_argument("--weights", type=str, default="./weights/mobile_sam.pt", help="Path to SAM weights")
+    parser.add_argument("--image", type=str, default="no_ros/images/2.jpg", help="Path to your image")
+    parser.add_argument("--weights", type=str, default="no_ros/model/mobile_sam.pt", help="Path to SAM weights")
+    parser.add_argument("--yolo_weights", type=str, default="no_ros/model/2-26merged.pt", help="Path to YOLO weights")
     args = parser.parse_args()
 
     # 1. 加载图像
@@ -65,19 +69,80 @@ if __name__ == "__main__":
     global img_display
     img_display = image.copy()
 
-    # 2. 交互式获取点
-    cv2.namedWindow("Image - Click Left for Foreground, Right for Background, Enter to Segment", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Image - Click Left for Foreground, Right for Background, Enter to Segment", mouse_callback)
+    # 2. YOLO 自动检测 (获取初始提示点)
+    print(f"Loading YOLO model from {args.yolo_weights}...")
+    yolo_model = YOLO(args.yolo_weights)
+    yolo_results = yolo_model.predict(image, conf=0.25, classes=[0], verbose=False)
     
-    print("--- Instructions for Angle Calculation ---")
-    print("1. Click LEFT mouse button on the TOP REFERENCE POINT (e.g., top hole).")
-    print("2. Click LEFT mouse button on the PIVOT POINT (e.g., bottom knob).")
-    print("   -> These two points will define the PURPLE reference line.")
-    print("3. Click LEFT/RIGHT to add more Foreground/Background points if needed.")
-    print("4. Press ENTER or ESC to apply segmentation.")
-    print("------------------------------------------")
+    yolo_points = []
+    # 获取所有的检测框中心点
+    if len(yolo_results) > 0 and len(yolo_results[0].boxes) > 0:
+        for box in yolo_results[0].boxes:
+            xyxy = box.xyxy.cpu().numpy()[0]
+            cx, cy = int((xyxy[0] + xyxy[2]) / 2), int((xyxy[1] + xyxy[3]) / 2)
+            yolo_points.append({'pt': [cx, cy], 'box': xyxy})
+            # 在显示图中画出 YOLO 框 (虚线或浅色)
+            cv2.rectangle(img_display, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), (100, 100, 0), 1)
+            cv2.circle(img_display, (cx, cy), 3, (255, 255, 0), -1)
+            
+    print(f"YOLO detected {len(yolo_points)} knobs.")
 
-    cv2.imshow("Image - Click Left for Foreground, Right for Background, Enter to Segment", img_display)
+    # ------ 智能聚类逻辑 ------
+    # 因为闸刀垂直安装，同一个闸刀的两个旋钮 x 坐标相近
+    X_THRESHOLD = 80  # 放宽 x 坐标差异阈值 (考虑透视和视角倾斜)
+    
+    # 按 x 坐标排序方便聚类
+    yolo_points.sort(key=lambda item: item['pt'][0])
+    
+    clusters = []
+    if yolo_points:
+        current_cluster = [yolo_points[0]]
+        for i in range(1, len(yolo_points)):
+            # 计算当前聚类的 x 坐标平均值作为中心
+            avg_x = sum(p['pt'][0] for p in current_cluster) / len(current_cluster)
+            # 如果当前点与中心的 x 距离在阈值内，归为一类
+            if abs(yolo_points[i]['pt'][0] - avg_x) < X_THRESHOLD:
+                current_cluster.append(yolo_points[i])
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [yolo_points[i]]
+        clusters.append(current_cluster)
+        
+    print(f"Clustered into {len(clusters)} potential switch groups based on X-coordinate.")
+    
+    # 解析聚类结果，寻找合法的上下旋钮对
+    for i, cluster in enumerate(clusters):
+        if len(cluster) == 2:
+            # 找到正好一对，按 y 坐标排序，区分上下
+            cluster.sort(key=lambda item: item['pt'][1])
+            top_pt = cluster[0]['pt']
+            pivot_pt = cluster[1]['pt']
+            switch_groups.append({'top': top_pt, 'pivot': pivot_pt, 'id': len(switch_groups)+1})
+            
+            # 绘制配对连线和明确标识
+            cv2.line(img_display, tuple(top_pt), tuple(pivot_pt), (0, 255, 0), 2)
+            cv2.circle(img_display, tuple(top_pt), 6, (0, 255, 0), -1)   # Top 绿色
+            cv2.circle(img_display, tuple(pivot_pt), 8, (128, 255, 0), -1) # Pivot 偏绿
+            cv2.putText(img_display, f"SW{len(switch_groups)}", (int(top_pt[0])-20, int(top_pt[1])-20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            print(f"  Valid Switch Group {len(switch_groups)}: Top={top_pt}, Pivot={pivot_pt}")
+        else:
+            print(f"  Ignored invalid cluster with {len(cluster)} points: {[p['pt'] for p in cluster]}")
+    # ---------------------------
+
+    # 3. 交互式获取点 (备用或手动补充)
+    cv2.namedWindow("Image - Interactive SAM", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("Image - Interactive SAM", mouse_callback)
+    
+    print("\n--- Multi-Switch Detection Mode ---")
+    print(f"Auto-detected {len(switch_groups)} switches via YOLO.")
+    print("If automatic detection missed something, you can manually:")
+    print("1. Click LEFT -> Top Reference Point")
+    print("2. Click LEFT -> Bottom Pivot Point (These 2 consecutive clicks will form a new switch group)")
+    print("3. Press ENTER or ESC to apply segmentation to ALL detected switches.")
+    print("-----------------------------------")
+
+    cv2.imshow("Image - Interactive SAM", img_display)
     
     # 等待用户按键 (Enter: 13, ESC: 27)
     while True:
@@ -87,17 +152,24 @@ if __name__ == "__main__":
             
     cv2.destroyAllWindows()
 
-    if len(input_points) == 0:
-        print("No points selected. Exiting.")
+    if len(switch_groups) == 0 and len(manual_points) < 2:
+        print("No valid switch groups automatically detected AND manual points are insufficient. Exiting.")
         exit(0)
 
-    points_np = np.array(input_points)
-    labels_np = np.array(input_labels)
-    print(f"Selected {len(points_np)} points. Initializing MobileSAM...")
+    # 整合待处理的所有靶标组
+    # 将手动点击的点（如果 >= 2）作为一个补充的 switch_group 加入
+    if len(manual_points) >= 2:
+        m_top = manual_points[0]
+        m_pivot = manual_points[1]
+        switch_groups.append({'top': m_top, 'pivot': m_pivot, 'id': len(switch_groups)+1})
+        print(f"Added Manual Switch Group {len(switch_groups)}: Top={m_top}, Pivot={m_pivot}")
 
-    # 3. 初始化 MobileSAM
-    # 根据我们之前处理 gfx803 的经验，强制使用 cpu
-    device = torch.device("cpu")
+    print(f"Initializing MobileSAM for {len(switch_groups)} switches...")
+
+    # 4. 初始化 MobileSAM
+    # 使用 CUDA 加速 (如果可用)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     model_type = "vit_t"
 
     mobile_sam = sam_model_registry[model_type](checkpoint=weight_path)
@@ -108,100 +180,92 @@ if __name__ == "__main__":
 
     print("Setting image to MobileSAM...")
     predictor.set_image(image_rgb)
-
-    print("Running prediction...")
-    # 4. 执行预测
-    masks, scores, logits = predictor.predict(
-        point_coords=points_np,
-        point_labels=labels_np,
-        multimask_output=True, # 设为 True 会返回三个不同层次的 mask 建议，我们选得分最高的一个
-    )
-
-    print("Prediction complete! Displaying result...")
-
-    # 5. 可视化结果 (选择 score 最高的 mask 此时已经默认按 score 排序输出，0 是最高或者最优选，我们均展示)
-    best_mask = masks[np.argmax(scores)]
-    best_score = max(scores)
-
-    # ---------------- 角度计算模块 ----------------
-    # 假设用户的第一个前景点是“非轴心”端，或者是通过 Mask 的几何特征自动寻找长轴
-    mask_uint8 = (best_mask * 255).astype(np.uint8)
-    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    angle_text = "Angle: N/A"
-    if len(contours) > 0:
-        # 找到最大的轮廓
-        c = max(contours, key=cv2.contourArea)
-        # 获取最小外接矩形 (中心(x,y), (宽,高), 旋转角度deg)
-        rect = cv2.minAreaRect(c)
-        (cx, cy), (w, h), rect_angle = rect
-        
-        # minAreaRect 的角度范围有历史包袱，通常计算长边与 X 轴的夹角更直观
-        # 判断哪条边更长，来决定物体的朝向轴
-        if w < h:
-            angle_deg = rect_angle + 90
-        else:
-            angle_deg = rect_angle
+    # 用于收集每个闸刀的 Mask 以便最终合并显示
+    all_masks = []
+    angle_results = []
 
-        # 需求: 提取基于两个特定点击的基准线，并计算相对夹角
-        pos_points = points_np[labels_np == 1]
+    print("Running predictions for each switch group...")
+    # 5. 遍历每个闸刀组进行预测和计算
+    for sg in switch_groups:
+        top_pt = sg['top']
+        pivot_pt = sg['pivot']
+        sw_id = sg['id']
         
-        # 只需要用户提供2个绿点: 第一个是顶部参考(基准)，第二个是底部轴心(pivot)
-        if len(pos_points) >= 2:
-            ref_top = pos_points[0]   # 顶部参考点
-            pivot_pt = pos_points[1]  # 底部轴心点
+        # 组装 Prompt 点
+        points_np = np.array([top_pt, pivot_pt])
+        labels_np = np.array([1, 1]) # 两个都是前景点
+        
+        # 执行预测
+        masks, scores, logits = predictor.predict(
+            point_coords=points_np,
+            point_labels=labels_np,
+            multimask_output=True,
+        )
+        
+        best_mask = masks[np.argmax(scores)]
+        best_score = max(scores)
+        all_masks.append(best_mask)
+
+        # ---------------- 角度计算模块 ----------------
+        mask_uint8 = (best_mask * 255).astype(np.uint8)
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        angle_text = f"SW{sw_id}: N/A"
+        if len(contours) > 0:
+            c = max(contours, key=cv2.contourArea)
+            rect = cv2.minAreaRect(c)
+            (cx, cy), (w, h), rect_angle = rect
+            
+            if w < h:
+                angle_deg = rect_angle + 90
+            else:
+                angle_deg = rect_angle
+
+            ref_top = np.array(top_pt)
+            pivot_pt_np = np.array(pivot_pt)
             
             # 1. 绘制基准线 (Top -> Pivot)
-            cv2.line(image_rgb, tuple(ref_top), tuple(pivot_pt), (128, 0, 128), 3) # Purple line
-            cv2.circle(image_rgb, tuple(ref_top), 6, (128, 0, 128), 2)
-            cv2.circle(image_rgb, tuple(pivot_pt), 8, (128, 255, 0), 2) # 标记轴心
+            cv2.line(image_rgb, tuple(ref_top), tuple(pivot_pt_np), (128, 0, 128), 3) # Purple line
             
-            # 2. 依据用户 v5 脚本思路，使用凸包寻找“最左侧端点”及其修正路线作为刀尖
+            # 2. 寻找刀尖 (基于凸包和轮廓)
             hull = cv2.convexHull(c)
             hull_points = hull.reshape(-1, 2)
             
             if len(hull_points) >= 4:
-                # 寻找"最左下"的点 (x最小且y最大)
-                # 在图像坐标系中 y 向下递增，所以 score = x - y，score 最小的点即为最左下
-                score = hull_points[:, 0] - hull_points[:, 1]
-                leftbottom_idx = np.argmin(score)
+                # 寻找"最左下"的点
+                score_pts = hull_points[:, 0] * 5.0 - hull_points[:, 1]
+                leftbottom_idx = np.argmin(score_pts)
                 tip_raw = hull_points[leftbottom_idx]
                 
-                # 计算凸包边长，寻找“长斜边”来确定法向偏移
                 n_hull = len(hull_points)
                 edges = []
-                for i in range(n_hull):
-                    p1 = hull_points[i]
-                    p2 = hull_points[(i + 1) % n_hull]
+                for idx_e in range(n_hull):
+                    p1 = hull_points[idx_e]
+                    p2 = hull_points[(idx_e + 1) % n_hull]
                     dx = p2[0] - p1[0]
                     dy = p2[1] - p1[1]
                     length = np.hypot(dx, dy)
                     edges.append({'dx': dx, 'dy': dy, 'length': length})
                 
-                # 闸刀边缘特征：向左延伸，所以 dx < 0
                 slanted_candidates = [e for e in edges if e['dx'] < -5]
                 if slanted_candidates:
                     long_slanted_edge = max(slanted_candidates, key=lambda x: x['length'])
-                    # 计算法线向量 (原直线向量为 dx, dy，则向右/下沉的法向为 -dy, dx)
-                    # 注意我们希望法向是指向闸刀中心的（即如果长边在上方边缘，法相往下平移）
                     l_len = long_slanted_edge['length']
                     dx_norm = long_slanted_edge['dx'] / l_len
                     dy_norm = long_slanted_edge['dy'] / l_len
                     nx, ny = -dy_norm, dx_norm
                 else:
-                    # 缺省给一个向右下方的法向偏移
                     nx, ny = 0.5, 0.866
                     
-                # 【动态平移量】：测量垂直那个轴的真实宽度
-                v_up_axis = ref_top - pivot_pt
+                v_up_axis = ref_top - pivot_pt_np
                 len_up_axis = np.linalg.norm(v_up_axis)
-                offset_dist = 20.0 # 默认后备值
+                offset_dist = 20.0 
                 if len_up_axis > 0:
                     v_up_norm = v_up_axis / len_up_axis
                     v_perp = np.array([-v_up_norm[1], v_up_norm[0]])
                     h_img, w_img = mask_uint8.shape
                     
-                    # 为了避免小角度时射线打到闸刀上，直接使用上方固定的基准点(小圆柱体)中心作为测距起始点
                     eval_pt = ref_top.copy().astype(float)
                     
                     def ray_cast(start, d):
@@ -218,27 +282,19 @@ if __name__ == "__main__":
                     w2 = ray_cast(eval_pt, -v_perp)
                     axis_width = w1 + w2
                     if axis_width > 0:
-                        # 用真实厚度取代定值, 系数 0.85-0.9 比较符合 v5 的表现
                         offset_dist = (axis_width / 2.0) * 0.85 
-                        print(f"Measured axis width at top ref: {axis_width} px, dynamic offset: {offset_dist:.1f} px")
                 
-                tip_final = np.array([tip_raw[0] + nx * offset_dist, tip_raw[1] + ny * offset_dist], dtype=int)
+                tip_final = np.array([float(tip_raw[0]) + nx * offset_dist, float(tip_raw[1]) + ny * offset_dist], dtype=int)
                 tip_pt = tip_final 
                 
-                # 绘制最初始的“最左点”方便对比
                 cv2.circle(image_rgb, tuple(tip_raw), 4, (0, 255, 255), -1)
-                
-                # 绘制实际经过偏置校准后的朝向线 (Pivot -> Tip)
-                cv2.arrowedLine(image_rgb, tuple(pivot_pt), tuple(tip_pt), (255, 165, 0), 4, tipLength=0.08)
+                cv2.arrowedLine(image_rgb, tuple(pivot_pt_np), tuple(tip_pt), (255, 165, 0), 4, tipLength=0.08)
                 cv2.circle(image_rgb, tuple(tip_pt), 6, (255, 165, 0), -1)
                 
                 # 3. 计算物理夹角
-                # 垂直基准向量
-                v_up = ref_top - pivot_pt
-                # 实际活动向量
-                v_slant = tip_pt - pivot_pt
+                v_up = ref_top - pivot_pt_np
+                v_slant = tip_pt - pivot_pt_np
                 
-                # 余弦定理求无向夹角 (符合物理夹角直觉 0-180)
                 len_up = np.linalg.norm(v_up)
                 len_slant = np.linalg.norm(v_slant)
                 
@@ -250,33 +306,34 @@ if __name__ == "__main__":
                 else:
                     angle_between = 0.0
                     
-                angle_text = f"Blade Angle: {angle_between:.1f} deg"
-                print(f"Calculated Pivot: {pivot_pt}, Tip: {tip_pt}")
-                print(f"Base Vector: {v_up}, Slant Vector: {v_slant}, {angle_text}")
-        elif len(pos_points) == 1:
-            # 兼容仅点击了单点的情况
-            pivot_pt = pos_points[0]
-            hull = cv2.convexHull(c)
-            hull_points = hull.reshape(-1, 2)
-            if len(hull_points) > 0:
-                score = hull_points[:, 0] - hull_points[:, 1]
-                leftbottom_idx = np.argmin(score)
-                tip_pt = hull_points[leftbottom_idx]
-                dy = -(tip_pt[1] - pivot_pt[1]) 
-                dx = tip_pt[0] - pivot_pt[0]
-                directed_angle = np.degrees(np.arctan2(dy, dx))
-                angle_text = f"Absolute Angle: {directed_angle:.1f} deg"
-                cv2.arrowedLine(image_rgb, tuple(pivot_pt), tuple(tip_pt), (255, 165, 0), 4, tipLength=0.1)
-                cv2.circle(image_rgb, tuple(pivot_pt), 8, (255, 255, 0), 2)
-        else:
-            angle_text = f"Axis Angle: {angle_deg:.1f} deg (Undirected)"
-    # ---------------------------------------------
+                angle_text = f"SW{sw_id}: {angle_between:.1f} deg"
+                # 在图像上该闸刀中心位置标示角度
+                cv2.putText(image_rgb, angle_text, (pivot_pt[0]+30, pivot_pt[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 100, 100), 2)
+            else:
+                angle_text = f"SW{sw_id} Axis: {angle_deg:.1f} deg"
+        
+        angle_results.append(angle_text)
+        print(angle_text)
+        # ---------------------------------------------
 
     plt.figure(figsize=(10, 10))
     plt.imshow(image_rgb)
-    show_mask(best_mask, plt.gca())
-    show_points(points_np, labels_np, plt.gca())
-    plt.title(f"MobileSAM Mask & Angle\n{angle_text}", fontsize=18)
+    
+    # 叠加所有闸刀的 Mask
+    for mask in all_masks:
+        show_mask(mask, plt.gca(), random_color=True)
+        
+    # 显示所有的提示点
+    pts_to_draw = []
+    lbl_to_draw = []
+    for sg in switch_groups:
+        pts_to_draw.extend([sg['top'], sg['pivot']])
+        lbl_to_draw.extend([1, 1])
+    if pts_to_draw:
+        show_points(np.array(pts_to_draw), np.array(lbl_to_draw), plt.gca())
+
+    title_str = "Multi-Switch Angle Detection\n" + " | ".join(angle_results)
+    plt.title(title_str, fontsize=14)
     plt.axis('off')
     plt.tight_layout()
     

@@ -18,3 +18,9 @@ __pycache__/
 
 # Other
 .DS_Store
+
+*.mp4
+*.png
+*.jpg
+*.zip
+*.data
