@@ -5,6 +5,7 @@ IBVS 精度记录工具
 
 功能:
   1. 打开 RealSense 相机 + YOLO 检测
+  1. 打开普通相机 + YOLO 检测
   2. 读取 target_config.json 中的目标参数 (u, v, area) 作为基准
   3. 连续采集若干帧取中位数，计算当前的 XY 像素误差和面积误差
   4. 将结果追加写入 experiment_log.json（支持多次实验）
@@ -25,13 +26,6 @@ import argparse
 from datetime import datetime
 from ultralytics import YOLO
 
-try:
-    import pyrealsense2 as rs
-    HAS_REALSENSE = True
-except ImportError:
-    HAS_REALSENSE = False
-    print("⚠️ pyrealsense2 未安装，将使用 OpenCV 摄像头")
-
 # ==========================================
 # 配置
 # ==========================================
@@ -40,6 +34,9 @@ YOLO_MODEL_PATH = os.path.join(SCRIPT_DIR, 'model', '2-26merged.pt')
 TARGET_CLASS_ID = 0
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'target_config.json')
 LOG_FILE = os.path.join(SCRIPT_DIR, 'experiment_log.json')
+CAMERA_INDEX = 0
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
 
 
 def load_target_config():
@@ -50,38 +47,23 @@ def load_target_config():
     with open(CONFIG_FILE) as f:
         cfg = json.load(f)
     print(f"📌 基准参数: u={cfg['target_u']}, v={cfg['target_v']}, "
-          f"area={cfg.get('target_area')}, depth={cfg.get('target_depth')}")
+          f"area={cfg.get('target_area')}")
     return cfg
 
 
-def detect_current_state(model, pipeline=None, cap=None, align=None,
-                         temporal_filter=None, num_frames=20):
+def detect_current_state(model, cap, num_frames=20):
     """
     连续采集 num_frames 帧，对每帧做 YOLO 检测，
-    取所有检测结果的中位数作为最终的 (u, v, area, depth)
+    取所有检测结果的中位数作为最终的 (u, v, area)
     """
-    all_u, all_v, all_area, all_depth = [], [], [], []
+    all_u, all_v, all_area = [], [], []
 
     print(f"📷 采集 {num_frames} 帧数据...")
     for i in range(num_frames):
         # 取图
-        if HAS_REALSENSE and pipeline is not None:
-            frames = pipeline.wait_for_frames()
-            if align:
-                frames = align.process(frames)
-            color_frame = frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()
-            if not color_frame:
-                continue
-            if temporal_filter and depth_frame:
-                depth_frame = temporal_filter.process(depth_frame)
-            frame = np.asanyarray(color_frame.get_data())
-            depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
-        else:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            depth_image = None
+        ret, frame = cap.read()
+        if not ret:
+            continue
 
         # YOLO 检测 (不使用 track，避免 ID 跳动影响)
         results = model.predict(
@@ -105,18 +87,6 @@ def detect_current_state(model, pipeline=None, cap=None, align=None,
             all_v.append(v)
             all_area.append(area)
 
-            # 深度 (如果有的话)
-            if depth_image is not None:
-                cx, cy = int(u), int(v)
-                h, w = depth_image.shape
-                r = 5
-                y_lo, y_hi = max(0, cy - r), min(h, cy + r)
-                x_lo, x_hi = max(0, cx - r), min(w, cx + r)
-                roi = depth_image[y_lo:y_hi, x_lo:x_hi].flatten()
-                valid = roi[(roi > 100) & (roi < 1500)]
-                if len(valid) > 0:
-                    all_depth.append(float(np.median(valid)) / 1000.0)
-
         time.sleep(0.03)  # ~30fps
 
     if len(all_u) == 0:
@@ -127,7 +97,6 @@ def detect_current_state(model, pipeline=None, cap=None, align=None,
         'measured_u': float(np.median(all_u)),
         'measured_v': float(np.median(all_v)),
         'measured_area': float(np.median(all_area)),
-        'measured_depth': float(np.median(all_depth)) if all_depth else None,
         'num_detections': len(all_u),
         'u_std': float(np.std(all_u)),
         'v_std': float(np.std(all_v)),
@@ -150,19 +119,12 @@ def compute_errors(target_cfg, measurement):
         err_area_abs = None
         err_area_ratio = None
 
-    target_depth = target_cfg.get('target_depth')
-    if target_depth and measurement['measured_depth']:
-        err_depth = measurement['measured_depth'] - target_depth
-    else:
-        err_depth = None
-
     return {
         'err_u': round(err_u, 2),
         'err_v': round(err_v, 2),
         'err_xy': round(err_xy, 2),
         'err_area_abs': round(err_area_abs, 1) if err_area_abs is not None else None,
         'err_area_ratio_pct': round(err_area_ratio, 2) if err_area_ratio is not None else None,
-        'err_depth_m': round(err_depth, 4) if err_depth is not None else None,
     }
 
 
@@ -183,7 +145,7 @@ def append_to_log(record):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="IBVS 精度记录工具")
+    parser = argparse.ArgumentParser(description="IBVS 精度记录工具 (普通摄像头版)")
     parser.add_argument("--tag", type=str, default="", help="实验标签，如 ibvs_run1")
     parser.add_argument("--method", type=str, default="ibvs",
                         choices=["ibvs", "pbvs"],
@@ -204,43 +166,31 @@ def main():
     # 2. YOLO
     print(f"Loading YOLO: {YOLO_MODEL_PATH}")
     model = YOLO(YOLO_MODEL_PATH)
+    # 首次预热
     model(np.zeros((640, 640, 3), dtype=np.uint8), imgsz=640, half=True, verbose=False)
     print("YOLO ready.")
 
-    # 3. 相机
-    pipeline = None
-    cap = None
-    align = None
-    temporal_filter = None
+    # 3. 初始化普通摄像头
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print(f"❌ 无法打开摄像头 {CAMERA_INDEX}")
+        return
 
-    if HAS_REALSENSE:
-        pipeline = rs.pipeline()
-        config = rs.config()
-        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
-        profile = pipeline.start(config)
-        align = rs.align(rs.stream.color)
-        temporal_filter = rs.temporal_filter()
-        print("RealSense 1280x720 + D2C ready.")
-        # 预热几帧
-        for _ in range(10):
-            pipeline.wait_for_frames()
-    else:
-        cap = cv2.VideoCapture(0)
-        print("OpenCV camera ready.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    print(f"📷 摄像头已就绪: {FRAME_WIDTH}x{FRAME_HEIGHT}")
+
+    # 预热几帧让曝光稳定
+    for _ in range(10):
+        cap.read()
 
     # 4. 采集并计算
     try:
         measurement = detect_current_state(
-            model, pipeline=pipeline, cap=cap,
-            align=align, temporal_filter=temporal_filter,
-            num_frames=args.frames
+            model, cap, num_frames=args.frames
         )
     finally:
-        if pipeline:
-            pipeline.stop()
-        if cap:
-            cap.release()
+        cap.release()
 
     if measurement is None:
         print("❌ 采集失败")
@@ -258,7 +208,6 @@ def main():
             'u': target_cfg['target_u'],
             'v': target_cfg['target_v'],
             'area': target_cfg.get('target_area'),
-            'depth': target_cfg.get('target_depth'),
         },
         'measurement': measurement,
         'errors': errors,
@@ -278,8 +227,6 @@ def main():
     if errors['err_area_ratio_pct'] is not None:
         print(f"  面积误差:    {errors['err_area_abs']:.1f} px²  "
               f"({errors['err_area_ratio_pct']:.2f}%)")
-    if errors['err_depth_m'] is not None:
-        print(f"  深度误差:    {errors['err_depth_m']*1000:.1f} mm")
     print("=" * 50)
 
     # 7. 写入日志

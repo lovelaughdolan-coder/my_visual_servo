@@ -43,7 +43,6 @@ def analyze(records, group_key='method'):
         ('err_v',              'XY-V 误差 (px)',         'px'),
         ('err_xy',             'XY 欧氏距离 (px)',       'px'),
         ('err_area_ratio_pct', '面积比例误差 (%)',       '%'),
-        ('err_depth_m',        '深度误差 (m)',           'm'),
     ]
 
     print("\n" + "=" * 72)
